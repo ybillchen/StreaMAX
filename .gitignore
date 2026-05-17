@@ -37,3 +37,7 @@ venv/
 # --- Local config ---
 *.local
 sftp-config.json
+
+# --- Claude Code ---
+.claude/
+CLAUDE.md

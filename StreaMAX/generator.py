@@ -7,66 +7,67 @@ from .utils import get_rj_vj_R, prepare_params
 from .methods import create_ic_particle_spray_Fardal2015, create_ic_particle_spray_Chen2025
 from .integrants import integrate_leapfrog_final, integrate_leapfrog_traj, combined_integrate_leapfrog_final, precompute_prog_trajectories
 
-@partial(jax.jit, static_argnames=('type_host', 'type_sat', 'n_particles', 'n_steps', 'unroll', 
+@partial(jax.jit, static_argnames=('type_host', 'type_sat', 'n_particles', 'n_steps', 'unroll',
                                     'type_method'))
-def generate_stream(xv_f, 
-                    type_host, params_host, 
-                    type_sat, params_sat, 
-                    time, alpha, n_steps,
-                    n_particles, 
+def generate_stream(xv_f,
+                    type_host, params_host,
+                    type_sat, params_sat,
+                    start_time, alpha, n_steps,
+                    n_particles,
                     unroll,
+                    end_time=0,
                     type_method='Fardal2015',
-                    m_f_sat=0, 
+                    m_f_sat=0,
                     tail=0, seed=111):
 
-    # Define Acceleration function from Type of Host
-    if type_host == 'PointMass':
-        acc_host = PointMass_acceleration
-    elif type_host == 'Isochrone':
-        acc_host = Isochrone_acceleration
-    elif type_host == 'Plummer':
-        acc_host = Plummer_acceleration
-    elif type_host == 'NFW':
-        acc_host = NFW_acceleration
-    elif type_host == 'MiyamotoNagai':
-        acc_host = MiyamotoNagai_acceleration
-    elif type_host == 'Logarithmic':
-        acc_host = Logarithmic_acceleration
-    elif type_host == 'Bar_potential':
-        acc_host = Bar_acceleration
-    elif type_host == 'Hernquist':
-        acc_host = Hernquist_acceleration
-    elif type_host == 'ExpDisk':
-        acc_host = ExpDisk_acceleration
-    elif type_host == 'DiskNFW':
-        acc_host = NFW_MiyamotoNagai_acceleration
-    elif type_host == 'Composite':
-        # TODO: implement composite potential selection
-        raise NotImplementedError("Composite potential not yet implemented.")
-    else:
-        raise NotImplementedError(f"Host potential {type_host} not implemented.")
+    # Lookup table for single-component potentials (used by both host dispatch and Composite)
+    _SINGLE_ACC = {
+        'PointMass':     PointMass_acceleration,
+        'Isochrone':     Isochrone_acceleration,
+        'Plummer':       Plummer_acceleration,
+        'NFW':           NFW_acceleration,
+        'MiyamotoNagai': MiyamotoNagai_acceleration,
+        'Logarithmic':   Logarithmic_acceleration,
+        'Bar_potential': Bar_acceleration,
+        'Hernquist':     Hernquist_acceleration,
+        'ExpDisk':       ExpDisk_acceleration,
+        'DiskNFW':       NFW_MiyamotoNagai_acceleration,
+    }
 
-    # Define Acceleration function from Type of Sat
-    if type_sat == 'PointMass':
-        acc_sat = PointMass_acceleration
-    elif type_sat == 'Isochrone':
-        acc_sat = Isochrone_acceleration
-    elif type_sat == 'Plummer':
-        acc_sat = Plummer_acceleration
-    elif type_sat == 'NFW':
-        acc_sat = NFW_acceleration
+    # Host acceleration and param preparation.
+    # Composite syntax: type_host = 'Composite:TYPE1,TYPE2,...'
+    #   params_host = list of component param dicts, in the same order as the type string.
+    #   Duplicate types are allowed (e.g. 'Composite:NFW,NFW' with two NFW dicts).
+    if type_host in _SINGLE_ACC:
+        acc_host    = _SINGLE_ACC[type_host]
+        params_host = prepare_params(params_host)
+    elif type_host.startswith('Composite:'):
+        _comp_types = tuple(type_host.split(':')[1].split(','))
+        _comp_fns   = tuple(_SINGLE_ACC[t] for t in _comp_types)
+        def acc_host(x, y, z, params):
+            return sum(fn(x, y, z, params[i]) for i, fn in enumerate(_comp_fns))
+        params_host = [prepare_params(p) for p in params_host]
     else:
-        raise NotImplementedError(f"Satellite potential {type_sat} not implemented.")
+        raise NotImplementedError(f"Host potential '{type_host}' not implemented.")
+
+    # Satellite acceleration and param preparation
+    _SAT_ACC = {
+        'PointMass': PointMass_acceleration,
+        'Isochrone': Isochrone_acceleration,
+        'Plummer':   Plummer_acceleration,
+        'NFW':       NFW_acceleration,
+    }
+    if type_sat in _SAT_ACC:
+        acc_sat    = _SAT_ACC[type_sat]
+        params_sat = prepare_params(params_sat)
+    else:
+        raise NotImplementedError(f"Satellite potential '{type_sat}' not implemented.")
 
     # Ensure float32 throughout (consistent on both CPU and GPU)
     xv_f = jnp.asarray(xv_f, dtype=jnp.float32)
 
-    # Precompute rotation matrices and linear masses once (avoids recomputation inside scan loops)
-    params_host = prepare_params(params_host)
-    params_sat  = prepare_params(params_sat)
-
-    # Define time step (dt) from total time and steps
-    dt = time/n_steps
+    # Define time step (dt) from total lookback time and number of steps
+    dt = start_time/n_steps
 
     # Get initial position of the prog by integrating backwards
     _, xv_i = integrate_leapfrog_final(xv_f, params_host, acc_host, n_steps, dt=-dt, unroll=unroll)
@@ -83,9 +84,13 @@ def generate_stream(xv_f,
 
     d2phi_dr2 = jax.vmap(_d2phi_radial)(xv_sat[:, :3])
 
-    # Satellite mass evolution along the orbit
-    m_sat = jnp.linspace(params_sat['logM'], m_f_sat, len(xv_sat))
-    dm    = (m_sat - m_f_sat)/n_steps # TODO: allow for mass loss with variable dm
+    # Satellite mass evolution: decreases linearly from logM at lookback start_time
+    # to m_f_sat at lookback end_time, then stays constant (end_time=0 recovers old behaviour).
+    # t_sat runs from 0 → start_time*alpha; physical time elapsed = t_sat/alpha.
+    t_loss_window = start_time - end_time
+    loss_frac = jnp.clip(t_sat / (alpha * t_loss_window), 0.0, 1.0)
+    m_sat = params_sat['logM'] + loss_frac * (m_f_sat - params_sat['logM'])
+    dm    = (m_sat - m_f_sat) / n_steps  # zero automatically after end_time
 
     # Create initial conditions for the particle spray
     if type_method == 'Fardal2015':
@@ -107,7 +112,7 @@ def generate_stream(xv_f,
 
     # Precompute progenitor trajectories once for each unique orbit release step,
     # then look them up per particle instead of re-integrating n_particles times.
-    dt_arr = (time - t_sat) * alpha / n_steps
+    dt_arr = (start_time - t_sat) * alpha / n_steps
     prog_pos, prog_M = precompute_prog_trajectories(
         xv_sat, params_host, acc_host, n_steps, dt_arr, m_sat, dm, unroll)
 
